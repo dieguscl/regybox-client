@@ -217,6 +217,33 @@
       border-color: #555;
       color: #aaa;
     }
+
+    /* Mode toggle */
+    .mode-toggle {
+      display: flex;
+      background: #111;
+      border: 1px solid #333;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-bottom: 24px;
+    }
+
+    .mode-toggle button {
+      flex: 1;
+      padding: 10px;
+      border: none;
+      background: transparent;
+      color: #888;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .mode-toggle button.active {
+      background: #4a9eff;
+      color: #fff;
+    }
   </style>
 </head>
 <body>
@@ -228,7 +255,12 @@
 
     <!-- Login form -->
     <div class="card" id="loginCard">
-      <div class="field">
+      <div class="mode-toggle">
+        <button id="modeUser" class="active" onclick="setMode('user')">I'm a member</button>
+        <button id="modeAdmin" onclick="setMode('admin')">I'm a box admin</button>
+      </div>
+
+      <div class="field" id="boxField">
         <label>Your box / gym</label>
         <input type="text" id="boxSearch" placeholder="Search your box..." autocomplete="off">
         <select id="boxSelect" style="margin-top: 8px;">
@@ -275,6 +307,16 @@
   <script>
     let allBoxes = [];
     let exportData = null;
+    let currentMode = 'user'; // 'user' or 'admin'
+
+    function setMode(mode) {
+      currentMode = mode;
+      document.getElementById('modeUser').className = mode === 'user' ? 'active' : '';
+      document.getElementById('modeAdmin').className = mode === 'admin' ? 'active' : '';
+      document.getElementById('boxField').style.display = mode === 'admin' ? 'none' : '';
+      document.getElementById('exportBtn').textContent = mode === 'admin' ? 'Export Box Data' : 'Export My Data';
+      document.getElementById('status').textContent = '';
+    }
 
     // Load boxes on page load
     async function loadBoxes() {
@@ -319,30 +361,43 @@
     }
 
     async function startExport() {
-      const box_id = document.getElementById('boxSelect').value;
       const email = document.getElementById('email').value;
       const password = document.getElementById('password').value;
+      const box_id = document.getElementById('boxSelect').value;
 
-      if (!box_id || !email || !password) {
+      if (currentMode === 'user' && (!box_id || !email || !password)) {
         document.getElementById('status').textContent = 'Please fill in all fields';
         document.getElementById('status').className = 'status error';
         return;
       }
 
+      if (currentMode === 'admin' && (!email || !password)) {
+        document.getElementById('status').textContent = 'Please enter your email and password';
+        document.getElementById('status').className = 'status error';
+        return;
+      }
+
       const btn = document.getElementById('exportBtn');
+      const btnLabel = currentMode === 'admin' ? 'Export Box Data' : 'Export My Data';
       btn.disabled = true;
       btn.textContent = 'Exporting...';
       document.getElementById('status').textContent = '';
 
-      setStep([
-        { cls: 'active', icon: '', text: 'Logging in and fetching your data...' },
-      ]);
+      const stepMsg = currentMode === 'admin'
+        ? 'Logging into admin panel and fetching box data...'
+        : 'Logging in and fetching your data...';
+      setStep([{ cls: 'active', icon: '', text: stepMsg }]);
 
       try {
-        const res = await fetch('/api/export', {
+        const endpoint = currentMode === 'admin' ? '/api/admin-export' : '/api/export';
+        const payload = currentMode === 'admin'
+          ? { email, password, box_id: box_id || '' }
+          : { email, password, box_id };
+
+        const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password, box_id }),
+          body: JSON.stringify(payload),
         });
 
         const data = await res.json();
@@ -353,21 +408,39 @@
 
         exportData = data;
 
-        // Build summary
-        const p = data.profile || {};
-        const a = data.attendance || {};
-        const r = data.records || [];
-        const c = Object.values(data.upcoming_classes || {}).flat().length;
+        // Build summary depending on mode
+        let summaryHtml;
+        if (currentMode === 'admin') {
+          const members = data.members?.data;
+          const plans = data.plans?.data;
+          const config = data.config?.data;
+          const memberCount = Array.isArray(members) ? members.length : '?';
+          const planCount = Array.isArray(plans) ? plans.length : '?';
+          const configCount = config ? Object.keys(config).length : '?';
+          const hasRaw = data._note ? '<br><em style="color:#ffa94d;">Some sections include raw HTML for debugging.</em>' : '';
+          summaryHtml = `
+            <strong>Box Admin Export</strong><br>
+            ${memberCount} member${memberCount !== 1 ? 's' : ''} &middot;
+            ${planCount} plan${planCount !== 1 ? 's' : ''} &middot;
+            ${configCount} config setting${configCount !== 1 ? 's' : ''}
+            ${hasRaw}
+          `;
+        } else {
+          const p = data.profile || {};
+          const a = data.attendance || {};
+          const r = data.records || [];
+          const c = Object.values(data.upcoming_classes || {}).flat().length;
+          summaryHtml = `
+            <strong>${p.name || 'User'}</strong><br>
+            ${a.total_signups || 0} sign-ups &middot;
+            ${a.total_attended || 0} attendances &middot;
+            ${a.total_absences || 0} absences<br>
+            ${r.length} personal record${r.length !== 1 ? 's' : ''} &middot;
+            ${c} upcoming class${c !== 1 ? 'es' : ''} this week
+          `;
+        }
 
-        document.getElementById('resultSummary').innerHTML = `
-          <strong>${p.name || 'User'}</strong><br>
-          ${a.total_signups || 0} sign-ups &middot;
-          ${a.total_attended || 0} attendances &middot;
-          ${a.total_absences || 0} absences<br>
-          ${r.length} personal record${r.length !== 1 ? 's' : ''} &middot;
-          ${c} upcoming class${c !== 1 ? 'es' : ''} this week
-        `;
-
+        document.getElementById('resultSummary').innerHTML = summaryHtml;
         document.getElementById('loginCard').style.display = 'none';
         document.getElementById('resultCard').style.display = 'block';
 
@@ -376,18 +449,21 @@
         document.getElementById('status').className = 'status error';
         document.getElementById('steps').style.display = 'none';
         btn.disabled = false;
-        btn.textContent = 'Export My Data';
+        btn.textContent = btnLabel;
       }
     }
 
     function downloadFile() {
       if (!exportData) return;
-      const name = (exportData.profile?.name || 'regybox').replace(/\s+/g, '_').toLowerCase();
+      const isAdmin = exportData.source === 'regybox_admin';
+      const name = isAdmin
+        ? 'regybox_admin_export'
+        : (exportData.profile?.name || 'regybox').replace(/\s+/g, '_').toLowerCase();
       const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${name}_regybox_export.json`;
+      a.download = `${name}.json`;
       a.click();
       URL.revokeObjectURL(url);
     }
@@ -396,8 +472,9 @@
       exportData = null;
       document.getElementById('loginCard').style.display = 'block';
       document.getElementById('resultCard').style.display = 'none';
+      const btnLabel = currentMode === 'admin' ? 'Export Box Data' : 'Export My Data';
       document.getElementById('exportBtn').disabled = false;
-      document.getElementById('exportBtn').textContent = 'Export My Data';
+      document.getElementById('exportBtn').textContent = btnLabel;
       document.getElementById('steps').style.display = 'none';
       document.getElementById('status').textContent = '';
     }

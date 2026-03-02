@@ -11,6 +11,7 @@ from flask import Flask, render_template, request, jsonify
 app = Flask(__name__)
 
 BASE_URL = "https://www.regybox.pt/app/app_nova"
+ADMIN_BASE_URL = "https://www.regybox.pt/admin2"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -20,6 +21,12 @@ HEADERS = {
 }
 
 
+def _fix_encoding(r: requests.Response) -> str:
+    """Regybox serves UTF-8 content but doesn't declare it. Force UTF-8."""
+    r.encoding = "utf-8"
+    return r.text
+
+
 def fetch_boxes() -> list[dict]:
     """Fetch the list of all boxes from Regybox."""
     r = requests.get(
@@ -27,7 +34,7 @@ def fetch_boxes() -> list[dict]:
         headers=HEADERS,
         timeout=15,
     )
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(_fix_encoding(r), "html.parser")
     boxes = []
     for div in soup.find_all("div", onclick=lambda x: x and "abre_login" in x):
         box_id = div["onclick"].split("'")[1]
@@ -48,7 +55,7 @@ def login(session: requests.Session, email: str, password: str, box_id: str) -> 
         headers=HEADERS,
         timeout=10,
     )
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(_fix_encoding(r), "html.parser")
 
     acs_input = soup.find("input", {"name": "acs"})
     if not acs_input:
@@ -107,13 +114,13 @@ def fetch_profile(session: requests.Session) -> dict:
         headers=HEADERS,
         timeout=10,
     )
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(_fix_encoding(r), "html.parser")
 
     fields = {}
     for inp in soup.find_all("input"):
         name = inp.get("name", "") or inp.get("id", "")
         val = inp.get("value", "")
-        if val and name and "hidden" not in name and "but_" not in name and not name.startswith("e"):
+        if val and name and "hidden" not in name and "but_" not in name and name not in ("estado",):
             fields[name] = val
 
     for sel in soup.find_all("select"):
@@ -148,7 +155,7 @@ def fetch_account(session: requests.Session) -> dict:
         headers=HEADERS,
         timeout=10,
     )
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(_fix_encoding(r), "html.parser")
     text = soup.get_text(separator="|", strip=True)
 
     plan = {}
@@ -185,7 +192,8 @@ def fetch_attendance(session: requests.Session) -> dict:
         headers=HEADERS,
         timeout=10,
     )
-    soup = BeautifulSoup(r.text, "html.parser")
+    text = _fix_encoding(r)
+    soup = BeautifulSoup(text, "html.parser")
 
     stats = {}
     labels = {"Inscri": "total_signups", "Presen": "total_attended", "Falta": "total_absences"}
@@ -204,14 +212,33 @@ def fetch_attendance(session: requests.Session) -> dict:
                     except ValueError:
                         pass
 
-    # Monthly graph data
-    match = re.search(r"valores=([^&]+)", r.text)
+    # Monthly graph data — convert month abbreviations to YYYY-MM keys
+    PT_MONTHS = {
+        "Jan": 1, "Fev": 2, "Mar": 3, "Abr": 4, "Mai": 5, "Jun": 6,
+        "Jul": 7, "Ago": 8, "Set": 9, "Out": 10, "Nov": 11, "Dez": 12,
+    }
+    match = re.search(r"valores=([^&]+)", text)
     if match:
         vals = match.group(1).split(",")
-        match_labels = re.search(r"datas=([^&]+)", r.text)
+        match_labels = re.search(r"datas=([^&]+)", text)
         if match_labels:
-            months = [m.strip("'") for m in match_labels.group(1).split(",")]
-            stats["monthly"] = dict(zip(months, [int(v) for v in vals]))
+            month_abbrs = [m.strip("'") for m in match_labels.group(1).split(",")]
+            # The chart shows the last 12 months ending at the current month
+            now = datetime.date.today()
+            monthly = {}
+            for i, (abbr, val) in enumerate(zip(month_abbrs, vals)):
+                month_num = PT_MONTHS.get(abbr, i + 1)
+                # Walk backwards: last entry = current month, first = 11 months ago
+                months_ago = len(month_abbrs) - 1 - i
+                d = now.replace(day=1) - datetime.timedelta(days=months_ago * 28)
+                # Snap to the correct month
+                d = d.replace(day=1)
+                while d.month != month_num:
+                    d -= datetime.timedelta(days=28)
+                    d = d.replace(day=1)
+                key = f"{d.year}-{d.month:02d}"
+                monthly[key] = int(val)
+            stats["monthly"] = monthly
 
     return stats
 
@@ -223,7 +250,7 @@ def fetch_records(session: requests.Session) -> list[dict]:
         headers=HEADERS,
         timeout=10,
     )
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(_fix_encoding(r), "html.parser")
 
     records = []
     for item in soup.find_all(class_="item-inner"):
@@ -255,7 +282,7 @@ def fetch_classes(session: requests.Session, token: str, date: datetime.date) ->
         timeout=15,
     )
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(_fix_encoding(r), "html.parser")
     classes = []
     for div in soup.find_all("div", class_="filtro0"):
         try:
@@ -282,6 +309,178 @@ def fetch_classes(session: requests.Session, token: str, date: datetime.date) ->
             continue
 
     return classes
+
+
+def admin_login(session: requests.Session, email: str, password: str, box_id: str) -> None:
+    """Authenticate through the admin panel login form."""
+    # Load the admin login page to get form structure
+    r = session.get(
+        f"{ADMIN_BASE_URL}/modulos/login/login.php",
+        headers=HEADERS,
+        timeout=15,
+    )
+    soup = BeautifulSoup(_fix_encoding(r), "html.parser")
+
+    # Find the obfuscated form fields (db_xyz, email_xyz pattern)
+    db_field = None
+    email_field = None
+    for inp in soup.find_all("input"):
+        name = inp.get("name", "")
+        if name.startswith("db_"):
+            db_field = name
+        elif name.startswith("email_"):
+            email_field = name
+
+    for sel in soup.find_all("select"):
+        name = sel.get("name", "")
+        if name.startswith("db_"):
+            db_field = name
+
+    if not email_field:
+        raise RuntimeError("Could not find admin login fields")
+
+    # Build login payload
+    payload = {
+        "lingua": "en",
+        email_field: email,
+        "password": password,
+    }
+    if db_field:
+        payload[db_field] = box_id
+
+    r = session.post(
+        f"{ADMIN_BASE_URL}/modulos/login/login.php",
+        data=payload,
+        headers=HEADERS,
+        timeout=15,
+        allow_redirects=True,
+    )
+
+    text = _fix_encoding(r)
+    if "login.php" in r.url and ("erro" in text.lower() or "error" in text.lower()):
+        raise RuntimeError("Admin login failed — wrong credentials or unauthorized")
+
+    # Verify we got past login by checking for typical admin page elements
+    if "login" in r.url.lower() and "modulos" not in text.lower():
+        raise RuntimeError("Admin login failed — could not access admin panel")
+
+
+def _safe_parse(html: str, parser_fn, label: str) -> dict:
+    """Try to parse HTML; on failure, return raw HTML for debugging."""
+    try:
+        return {"data": parser_fn(html), "raw_html": None}
+    except Exception as e:
+        return {"data": None, "raw_html": html, "parse_error": f"{label}: {str(e)}"}
+
+
+def fetch_admin_members(session: requests.Session) -> dict:
+    """Scrape the members list from the admin panel."""
+    r = session.get(
+        f"{ADMIN_BASE_URL}/modulos/membros/membros.php",
+        headers=HEADERS,
+        timeout=20,
+    )
+    html = _fix_encoding(r)
+
+    def parse(html):
+        soup = BeautifulSoup(html, "html.parser")
+        members = []
+        # Look for table rows with member data
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if len(rows) < 2:
+                continue
+            headers = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+            for row in rows[1:]:
+                cells = [td.get_text(strip=True) for td in row.find_all("td")]
+                if cells:
+                    entry = dict(zip(headers, cells)) if headers else {"fields": cells}
+                    members.append(entry)
+        if not members:
+            # Fallback: look for list-style member items
+            for item in soup.find_all(class_=re.compile(r"member|membro|item|row", re.I)):
+                text = item.get_text(strip=True)
+                if text:
+                    members.append({"text": text})
+        if not members:
+            raise ValueError("No member data found in page")
+        return members
+
+    return _safe_parse(html, parse, "members")
+
+
+def fetch_admin_plans(session: requests.Session) -> dict:
+    """Scrape plan/pricing configuration from the admin panel."""
+    r = session.get(
+        f"{ADMIN_BASE_URL}/modulos/planos/planos.php",
+        headers=HEADERS,
+        timeout=20,
+    )
+    html = _fix_encoding(r)
+
+    def parse(html):
+        soup = BeautifulSoup(html, "html.parser")
+        plans = []
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if len(rows) < 2:
+                continue
+            headers = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+            for row in rows[1:]:
+                cells = [td.get_text(strip=True) for td in row.find_all("td")]
+                if cells:
+                    entry = dict(zip(headers, cells)) if headers else {"fields": cells}
+                    plans.append(entry)
+        if not plans:
+            # Fallback: look for card/item elements
+            for item in soup.find_all(class_=re.compile(r"plan|plano|item|card", re.I)):
+                text = item.get_text(strip=True)
+                if text:
+                    plans.append({"text": text})
+        if not plans:
+            raise ValueError("No plan data found in page")
+        return plans
+
+    return _safe_parse(html, parse, "plans")
+
+
+def fetch_admin_config(session: requests.Session) -> dict:
+    """Scrape box configuration/settings from the admin panel."""
+    r = session.get(
+        f"{ADMIN_BASE_URL}/modulos/configuracoes/configuracoes.php",
+        headers=HEADERS,
+        timeout=20,
+    )
+    html = _fix_encoding(r)
+
+    def parse(html):
+        soup = BeautifulSoup(html, "html.parser")
+        config = {}
+        # Extract form fields (inputs and selects)
+        for inp in soup.find_all("input"):
+            name = inp.get("name", "") or inp.get("id", "")
+            val = inp.get("value", "")
+            itype = inp.get("type", "text")
+            if name and itype not in ("hidden", "submit", "button"):
+                config[name] = val
+        for sel in soup.find_all("select"):
+            name = sel.get("name", "") or sel.get("id", "")
+            selected = sel.find("option", selected=True)
+            if name and selected:
+                config[name] = selected.get_text(strip=True)
+        # Extract text blocks / labeled values
+        for label in soup.find_all("label"):
+            key = label.get_text(strip=True)
+            sibling = label.find_next_sibling()
+            if sibling and key:
+                val = sibling.get_text(strip=True)
+                if val:
+                    config[key] = val
+        if not config:
+            raise ValueError("No configuration data found in page")
+        return config
+
+    return _safe_parse(html, parse, "config")
 
 
 @app.route("/")
@@ -342,6 +541,51 @@ def api_export():
         return jsonify({"error": str(e)}), 401
     except Exception as e:
         return jsonify({"error": f"Export failed: {str(e)}"}), 500
+
+
+@app.route("/api/admin-export", methods=["POST"])
+def api_admin_export():
+    data = request.json
+    email = data.get("email", "")
+    password = data.get("password", "")
+    box_id = data.get("box_id", "")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    try:
+        session = requests.Session()
+        admin_login(session, email, password, box_id)
+
+        members = fetch_admin_members(session)
+        plans = fetch_admin_plans(session)
+        config = fetch_admin_config(session)
+
+        # Check if any section fell back to raw HTML
+        has_raw = any(
+            section.get("raw_html") for section in [members, plans, config]
+        )
+
+        export = {
+            "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "source": "regybox_admin",
+            "members": members,
+            "plans": plans,
+            "config": config,
+        }
+
+        if has_raw:
+            export["_note"] = (
+                "Some sections could not be parsed and include raw HTML. "
+                "Share this export with the developer to improve parsing."
+            )
+
+        return jsonify(export)
+
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 401
+    except Exception as e:
+        return jsonify({"error": f"Admin export failed: {str(e)}"}), 500
 
 
 if __name__ == "__main__":
